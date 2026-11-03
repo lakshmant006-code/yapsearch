@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useRef } from 'react';
+import Link from 'next/link';
 import ReactMarkdown from 'react-markdown';
 import { motion, AnimatePresence } from 'framer-motion';
 import remarkGfm from 'remark-gfm';
@@ -54,8 +55,9 @@ interface SuggestionType {
 // Add TopBar component
 const TopBar = () => {
   return (
-    <div className="fixed top-0 left-0 right-0 h-16 bg-white border-b border-gray-200 flex items-center px-6 z-50">
+    <div className="fixed top-0 left-0 right-0 h-16 bg-white border-b border-gray-200 flex items-center justify-between px-6 z-50">
       <h1 className="text-2xl font-serif text-gray-900 tracking-tight">YapSearch</h1>
+      <Link href="/accent" className="text-sm text-gray-500 hover:text-gray-900">Accent Detector →</Link>
     </div>
   );
 };
