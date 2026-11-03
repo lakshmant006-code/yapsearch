@@ -1,28 +1,29 @@
-# Accent Detector
+# F.A.K.E.
 
-Record someone speaking (or upload a clip) and find out whether their accent is real or put on.
+A satirical accent investigation, built with Next.js and Claude.
 
-## How it gets a precise answer
+## How it works
 
-1. **Quality gate (in the browser).** The clip is resampled to 16 kHz mono and checked for amount of speech, signal-to-noise ratio and clipping. Clips with under 10 s of speech or heavy noise are rejected instead of guessed at.
-2. **Three independent listens.** The whole clip is sent to an audio-input model three times. Each listen returns a verdict, a 0–100 authenticity score, and evidence that quotes specific words.
-3. **Per-segment drift check.** The clip is cut into ~10 s chunks at natural pauses. Each chunk is rated separately for how strongly it shows the target accent, so drift and fading are measured numerically instead of being left to the model's impression.
-4. **Conservative verdict rules** (`src/lib/accent/aggregate.ts`). "Probably put on" needs most listens to agree and a final score ≤ 40. "Sounds authentic" needs agreement, a score ≥ 60 and no significant drift. Anything else is reported as "Hard to tell". Strong drift lowers the score.
+1. **Evidence intake.** Upload a voice memo, type what you said, or both, and optionally say which accent you're "going for".
+2. **Measurements in the browser** (`src/lib/fake/audio.ts`). The voice memo is decoded locally and measured: seconds of speech, pitch range, speaking pace and pauses. The audio never leaves the browser.
+3. **The (fictional) score** (`src/lib/fake/judge.ts`). Words like “cheers” and “mate”, dropped T's (“wa’er”), pitch range, pace and whether you admitted to attempting an accent add up to a suspicion level and pick one of eight result types.
+4. **Claude writes the allegations** (`src/app/api/allegations/route.ts`). The server recomputes the score, sends the facts to Claude, and gets structured JSON back: the observation, suspected influence, vowel drama, evidence quality, charge and sentence. If Claude is switched off, unavailable or declines, a template "clerk" writes them instead, and the report says so.
 
-The results page shows each listen's score, the segment-by-segment strengths, and which rules produced the verdict.
+Claude never hears the audio. It only gets the numbers and the words.
 
 ## Setup
 
 ```
-cp .env.example .env.local   # then fill in OPENAI_API_KEY
+cp .env.example .env.local   # then fill in ANTHROPIC_API_KEY
 npm install
 npm run dev
 ```
 
 Environment variables:
 
-- `OPENAI_API_KEY`: required.
-- `OPENAI_AUDIO_MODEL`: optional, defaults to `gpt-audio`. Any chat-completions model that accepts `input_audio` works.
-- `OPENAI_BASE_URL`: optional, defaults to `https://api.openai.com/v1`.
+- `ANTHROPIC_API_KEY`: required for Claude-written allegations. Without it the app still works, using the template clerk.
+- `FAKE_CLAUDE_MODEL`: optional, defaults to `claude-opus-5-5`.
 
-Each analysis makes 3 full-clip calls plus up to 6 short segment calls.
+Requests use low effort and server-side refusal fallbacks (`fallbacks: "default"`).
+
+The illustration on the welcome and review screens is `public/fake-hero.webp`.

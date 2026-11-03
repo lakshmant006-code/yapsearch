@@ -1,5 +1,9 @@
-# Accent Detector
+# F.A.K.E.
 
-A web app that tells you whether an accent is real or put on. Record someone speaking (or upload a clip), optionally say which accent they're going for, and get a verdict with evidence, the moments where their real accent slipped through, and tips for doing the accent better.
+**Foreign Accent Knowledge Examiner.** Your vowels have some explaining to do.
 
-The app lives in [`template-2/`](template-2/). See its [README](template-2/README.md) for setup and an explanation of how the verdict is made precise.
+A satirical app that "investigates" whether you're putting on an accent. Submit a voice memo, what you said, or both, and the Accent Crimes Division files a deadpan report: a suspicion level, the evidence, and a sentence.
+
+Questioning accents, not identities. For entertainment only; the score is made up.
+
+The app lives in [`template-2/`](template-2/). See its [README](template-2/README.md) for setup.
