@@ -1,7 +1,14 @@
-// Browser-only: measures a voice memo. Claude can't hear audio, so these
-// numbers are what it (and the clerk) get to be judgmental about.
+// Browser-only: measures a recording. Claude can't hear audio, so these
+// numbers (plus what speech recognition heard) are what the llama judges.
 
-import type { AudioFacts } from './judge';
+export interface AudioFacts {
+  durationSec: number;
+  speechSec: number;
+  pauseRatio: number;
+  pitchRangeSemitones: number;
+  medianPitchHz: number;
+  syllablesPerSec: number;
+}
 
 export interface MeasuredAudio extends AudioFacts {
   peak: number;

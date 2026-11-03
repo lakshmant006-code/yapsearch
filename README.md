@@ -2,7 +2,7 @@
 
 **Foreign Accent Knowledge Examiner.** Your vowels have some explaining to do.
 
-A satirical app that "investigates" whether you're putting on an accent. Submit a voice memo, what you said, or both, and the Accent Crimes Division files a deadpan report: a suspicion level, the evidence, and a sentence.
+A sarcastic cartoon llama listens to your English, French or Italian accent and tells you, yes or no, whether it's real.
 
 Questioning accents, not identities. For entertainment only; the score is made up.
 

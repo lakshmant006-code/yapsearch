@@ -1,15 +1,31 @@
 # F.A.K.E.
 
-A satirical accent investigation, built with Next.js and Claude.
+A sarcastic cartoon llama listens to you and says whether your accent is real: a flat yes or no. Just for fun.
 
 ## How it works
 
-1. **Evidence intake.** A short onboarding flow: pick the accent you're "going for", then tap the orb to record (or upload a voice memo), type what you said, or both.
-2. **Measurements in the browser** (`src/lib/fake/audio.ts`). The recording is decoded locally and measured: seconds of speech, pitch range, speaking pace and pauses. The audio never leaves the browser.
-3. **The (fictional) score** (`src/lib/fake/judge.ts`). Words like “cheers” and “mate”, dropped T's (“wa’er”), pitch range, pace and whether you admitted to attempting an accent add up to a suspicion level and pick one of eight result types.
-4. **Claude writes the allegations** (`src/app/api/allegations/route.ts`). The server recomputes the score, sends the facts to Claude, and gets structured JSON back: the observation, suspected influence, vowel drama, evidence quality, charge and sentence. If Claude is switched off, unavailable or declines, a template "clerk" writes them instead, and the report says so.
+1. A "just for fun" notice opens every time.
+2. Pick **English**, **French** or **Italian** at the top. Suggested phrases sit at the bottom, but you can say anything.
+3. Tap the mic. The llama turns an ear toward you while it listens (up to 8 seconds, or tap again to stop).
+4. The browser does the listening (`src/app/page.tsx`, `src/lib/fake/audio.ts`):
+   - its speech recognition, set to the chosen language, returns what it heard and how sure it was;
+   - the recording is measured locally for speech time, pitch range, pace and pauses. The audio itself is never uploaded.
+5. **Claude judges** (`src/app/api/verdict/route.ts`): `claude-opus-5-5` gets those words and numbers and returns structured JSON, `{ ok, line }`. If Claude is unavailable, a house rule in `src/lib/fake/accents.ts` decides instead.
+6. **Accent OK**: the llama puts on sunglasses. **Accent Not OK**: a FAKE! stamp slams down, followed by NOPE, BUSTED, SUS and DENIED, with a screen shake.
 
-Claude never hears the audio. It only gets the numbers and the words.
+The llama is a single SVG with four poses (`src/lib/fake/llama.ts`); its styles and animations are in `src/app/globals.css`.
+
+Speech recognition works best in Chrome, Edge and Safari. Without it, the verdict leans on the voice measurements only.
+
+## Sound effects
+
+Sounds come from ElevenLabs: `pop`, `listen`, `ok`, `stamp`, `fake`, `spit` in `public/sfx/*.mp3`. Generate them with:
+
+```
+ELEVENLABS_API_KEY=... node scripts/generate-sfx.mjs
+```
+
+Any missing file falls back to a small synthesized sound, so the app works without them.
 
 ## Setup
 
@@ -19,9 +35,5 @@ npm install
 npm run dev
 ```
 
-Environment variables:
-
-- `ANTHROPIC_API_KEY`: required for Claude-written allegations. Without it the app still works, using the template clerk.
+- `ANTHROPIC_API_KEY`: lets Claude judge. Without it, the house rule decides.
 - `FAKE_CLAUDE_MODEL`: optional, defaults to `claude-opus-5-5`.
-
-Requests use low effort and server-side refusal fallbacks (`fallbacks: "default"`).
