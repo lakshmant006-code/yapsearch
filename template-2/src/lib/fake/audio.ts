@@ -5,7 +5,10 @@ import type { AudioFacts } from './judge';
 
 export interface MeasuredAudio extends AudioFacts {
   peak: number;
+  envelope: number[]; // 0-1 loudness per dot of the waveform
 }
+
+export const WAVE_DOTS = 28;
 
 const SR = 16000;
 const WIN = 640; // 40 ms
@@ -83,7 +86,17 @@ export async function measureAudio(blob: Blob): Promise<MeasuredAudio> {
       last = i;
     }
   }
+  const peakLevel = q(1) || 1;
+  const envelope: number[] = [];
+  for (let d = 0; d < WAVE_DOTS; d++) {
+    const a = Math.floor((d * rms.length) / WAVE_DOTS);
+    const b = Math.max(a + 1, Math.floor(((d + 1) * rms.length) / WAVE_DOTS));
+    let m = 0;
+    for (let i = a; i < b; i++) m = Math.max(m, rms[i] ?? 0);
+    envelope.push(Math.min(1, m / peakLevel));
+  }
   return {
+    envelope,
     durationSec: +dur.toFixed(1),
     speechSec: +speechSec.toFixed(1),
     pauseRatio: dur ? +(1 - speechSec / dur).toFixed(2) : 0,
