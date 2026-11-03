@@ -1,17 +1,43 @@
-// Client-side helpers: decode any browser-playable audio (webm/opus from the
-// mic, mp3/m4a/wav uploads) and re-encode it as 16 kHz mono 16-bit WAV, which
-// is a format audio-input models accept and keeps uploads small.
+// Client-side audio preparation: decode whatever the browser can play
+// (webm/opus from the mic, mp3/m4a/wav uploads), resample to 16 kHz mono,
+// measure recording quality, and pick segment boundaries at natural pauses so
+// the server can check whether the accent holds steady across the clip.
+
+import { encodeWav } from './pcm';
 
 export const TARGET_SAMPLE_RATE = 16000;
-export const MAX_SECONDS = 90;
+export const MAX_SECONDS = 60;
+export const MIN_SPEECH_SECONDS = 10; // below this we refuse to judge
+export const GOOD_SPEECH_SECONDS = 20; // below this confidence is capped
 
-export interface EncodedAudio {
-  base64: string;
+const FRAME_SEC = 0.02;
+const SEGMENT_TARGET_SEC = 10;
+const SEGMENT_MIN_SEC = 6;
+const SEGMENT_MAX_SEC = 14;
+const MAX_SEGMENTS = 6;
+
+export interface AudioQuality {
   durationSec: number;
+  speechSec: number;
+  snrDb: number;
+  clippedPct: number;
+  issues: string[];
+  blocking: boolean; // too poor to give a trustworthy answer
+}
+
+export interface Segment {
+  start: number;
+  end: number;
+}
+
+export interface PreparedAudio {
+  base64: string;
+  quality: AudioQuality;
+  segments: Segment[];
   truncated: boolean;
 }
 
-export async function blobToWav(blob: Blob): Promise<EncodedAudio> {
+export async function prepareAudio(blob: Blob): Promise<PreparedAudio> {
   const arrayBuffer = await blob.arrayBuffer();
   const AudioCtx: typeof AudioContext =
     window.AudioContext ||
@@ -25,19 +51,130 @@ export async function blobToWav(blob: Blob): Promise<EncodedAudio> {
   }
 
   const truncated = decoded.duration > MAX_SECONDS;
-  const durationSec = Math.min(decoded.duration, MAX_SECONDS);
-  const length = Math.ceil(durationSec * TARGET_SAMPLE_RATE);
+  const length = Math.ceil(Math.min(decoded.duration, MAX_SECONDS) * TARGET_SAMPLE_RATE);
 
-  // Resample + downmix to mono using an OfflineAudioContext.
+  // Resample + downmix to mono.
   const offline = new OfflineAudioContext(1, length, TARGET_SAMPLE_RATE);
   const src = offline.createBufferSource();
   src.buffer = decoded;
   src.connect(offline.destination);
   src.start(0);
   const rendered = await offline.startRendering();
-  const samples = normalize(rendered.getChannelData(0));
+  const raw = rendered.getChannelData(0);
 
-  return { base64: arrayBufferToBase64(encodeWav(samples, TARGET_SAMPLE_RATE)), durationSec, truncated };
+  const frames = frameRms(raw, TARGET_SAMPLE_RATE);
+  const quality = measureQuality(raw, frames);
+  const segments = quality.blocking ? [] : findSegments(frames, quality);
+  const samples = normalize(raw);
+
+  return { base64: bytesToBase64(encodeWav(samples, TARGET_SAMPLE_RATE)), quality, segments, truncated };
+}
+
+function frameRms(samples: Float32Array, sampleRate: number): Float32Array {
+  const size = Math.round(FRAME_SEC * sampleRate);
+  const n = Math.floor(samples.length / size);
+  const out = new Float32Array(n);
+  for (let f = 0; f < n; f++) {
+    let sum = 0;
+    for (let i = f * size; i < (f + 1) * size; i++) sum += samples[i] * samples[i];
+    out[f] = Math.sqrt(sum / size);
+  }
+  return out;
+}
+
+function percentile(values: Float32Array, p: number): number {
+  if (values.length === 0) return 0;
+  const sorted = Array.from(values).sort((a, b) => a - b);
+  return sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))];
+}
+
+// Energy-based voice activity: a frame is speech if it is well above the noise floor.
+function speechThreshold(frames: Float32Array): number {
+  const noise = percentile(frames, 0.1);
+  const loud = percentile(frames, 0.95);
+  return Math.max(noise * 3, loud * 0.1, 1e-4);
+}
+
+function measureQuality(samples: Float32Array, frames: Float32Array): AudioQuality {
+  const durationSec = samples.length / TARGET_SAMPLE_RATE;
+  const threshold = speechThreshold(frames);
+  let speechFrames = 0;
+  for (let i = 0; i < frames.length; i++) if (frames[i] > threshold) speechFrames++;
+  const speechSec = speechFrames * FRAME_SEC;
+
+  const noise = Math.max(percentile(frames, 0.1), 1e-5);
+  const speechLevel = percentile(frames, 0.9);
+  const snrDb = 20 * Math.log10(speechLevel / noise);
+
+  let clipped = 0;
+  for (let i = 0; i < samples.length; i++) if (Math.abs(samples[i]) >= 0.99) clipped++;
+  const clippedPct = (clipped / Math.max(1, samples.length)) * 100;
+
+  const issues: string[] = [];
+  let blocking = false;
+  if (speechLevel < 0.003) {
+    issues.push('The recording is almost silent. Check the microphone.');
+    blocking = true;
+  } else if (speechSec < MIN_SPEECH_SECONDS) {
+    issues.push(`Only ~${speechSec.toFixed(0)}s of speech detected. At least ${MIN_SPEECH_SECONDS}s is needed for a reliable judgement.`);
+    blocking = true;
+  } else if (speechSec < GOOD_SPEECH_SECONDS) {
+    issues.push(`~${speechSec.toFixed(0)}s of speech. ${GOOD_SPEECH_SECONDS}s+ gives a more precise result.`);
+  }
+  if (snrDb < 8) {
+    issues.push('Very noisy recording. Background noise hides the details that matter.');
+    blocking = true;
+  } else if (snrDb < 15) {
+    issues.push('Some background noise. A quieter room will improve precision.');
+  }
+  if (clippedPct > 1) issues.push('The audio is distorting (too loud). Move back from the mic.');
+
+  return { durationSec, speechSec, snrDb, clippedPct, issues, blocking };
+}
+
+// Split into ~10s chunks, cutting at the quietest frame in each window so no
+// word is cut in half. Chunks with too little speech are dropped.
+function findSegments(frames: Float32Array, quality: AudioQuality): Segment[] {
+  if (quality.speechSec < SEGMENT_MIN_SEC * 2) return [];
+  const threshold = speechThreshold(frames);
+  const total = frames.length;
+  const toFrames = (s: number) => Math.round(s / FRAME_SEC);
+  const segments: Segment[] = [];
+  let start = 0;
+
+  while (start < total) {
+    let end: number;
+    if (total - start <= toFrames(SEGMENT_MAX_SEC)) {
+      end = total;
+    } else {
+      const lo = start + toFrames(SEGMENT_MIN_SEC);
+      const hi = Math.min(total - toFrames(SEGMENT_MIN_SEC / 2), start + toFrames(SEGMENT_MAX_SEC));
+      end = start + toFrames(SEGMENT_TARGET_SEC);
+      let best = Infinity;
+      for (let f = lo; f < hi; f++) {
+        // Prefer quiet frames, lightly biased toward the target length.
+        const score = frames[f] + Math.abs(f - (start + toFrames(SEGMENT_TARGET_SEC))) * 1e-6;
+        if (score < best) {
+          best = score;
+          end = f;
+        }
+      }
+      // Don't leave a tail too short to judge; fold it into this segment.
+      if (total - end < toFrames(SEGMENT_MIN_SEC)) end = total;
+    }
+    let speech = 0;
+    for (let f = start; f < end; f++) if (frames[f] > threshold) speech++;
+    if (speech * FRAME_SEC >= 3) segments.push({ start: start * FRAME_SEC, end: end * FRAME_SEC });
+    start = end;
+  }
+
+  if (segments.length <= MAX_SEGMENTS) return segments;
+  // Too many: keep evenly spaced ones, always including the first and last.
+  const picked: Segment[] = [];
+  for (let i = 0; i < MAX_SEGMENTS; i++) {
+    picked.push(segments[Math.round((i * (segments.length - 1)) / (MAX_SEGMENTS - 1))]);
+  }
+  return picked;
 }
 
 // Peak-normalize quiet recordings so the model gets a usable level.
@@ -51,35 +188,7 @@ function normalize(samples: Float32Array): Float32Array {
   return out;
 }
 
-function encodeWav(samples: Float32Array, sampleRate: number): ArrayBuffer {
-  const buffer = new ArrayBuffer(44 + samples.length * 2);
-  const view = new DataView(buffer);
-  const writeStr = (offset: number, s: string) => {
-    for (let i = 0; i < s.length; i++) view.setUint8(offset + i, s.charCodeAt(i));
-  };
-  writeStr(0, 'RIFF');
-  view.setUint32(4, 36 + samples.length * 2, true);
-  writeStr(8, 'WAVE');
-  writeStr(12, 'fmt ');
-  view.setUint32(16, 16, true); // PCM chunk size
-  view.setUint16(20, 1, true); // PCM format
-  view.setUint16(22, 1, true); // mono
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * 2, true); // byte rate
-  view.setUint16(32, 2, true); // block align
-  view.setUint16(34, 16, true); // bits per sample
-  writeStr(36, 'data');
-  view.setUint32(40, samples.length * 2, true);
-  let offset = 44;
-  for (let i = 0; i < samples.length; i++, offset += 2) {
-    const s = Math.max(-1, Math.min(1, samples[i]));
-    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-  }
-  return buffer;
-}
-
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
+function bytesToBase64(bytes: Uint8Array): string {
   let binary = '';
   const chunk = 0x8000;
   for (let i = 0; i < bytes.length; i += chunk) {

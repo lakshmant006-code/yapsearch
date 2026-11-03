@@ -1,811 +1,613 @@
 'use client';
 
-import { useState, useRef } from 'react';
-import Link from 'next/link';
-import ReactMarkdown from 'react-markdown';
+import { useEffect, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import remarkGfm from 'remark-gfm';
+import { Mic, Square, Upload, Loader2, RotateCcw, CheckCircle2, AlertTriangle, HelpCircle } from 'lucide-react';
+import { prepareAudio, MAX_SECONDS, MIN_SPEECH_SECONDS, type PreparedAudio } from '@/lib/audio/wav';
+import { FAKE_MAX_SCORE, AUTHENTIC_MIN_SCORE } from '@/lib/accent/aggregate';
+import type { AccentAnalysis, AccentEvidence, Verdict } from '@/lib/accent/types';
 
-interface Message {
-  role: 'user' | 'assistant';
-  content: string;
-  reasoning?: string;
-  searchResults?: SearchResult[];
-  fullTavilyData?: TavilyResponse;
-  reasoningInput?: string;
-}
+const ACCENT_PRESETS = [
+  'British (RP)',
+  'Cockney',
+  'Scottish',
+  'Irish',
+  'Australian',
+  'Southern US',
+  'New York',
+  'Boston',
+  'French',
+  'Russian',
+  'Indian English',
+  'Jamaican',
+];
 
-interface TavilyImage {
-  url: string;
-  description?: string;
-}
+// The Speech Accent Archive elicitation paragraph: it packs in most English
+// sounds, so it's a good fixed text for comparing accents.
+const READING_PASSAGE =
+  'Please call Stella. Ask her to bring these things with her from the store: six spoons of fresh snow peas, five thick slabs of blue cheese, and maybe a snack for her brother Bob. We also need a small plastic snake and a big toy frog for the kids. She can scoop these things into three red bags, and we will go meet her Wednesday at the train station.';
 
-interface SearchResult {
-  title: string;
-  content: string;
-  url: string;
-  snippet?: string;
-  score?: number;
-  image?: TavilyImage;
-}
+type Phase = 'idle' | 'recording' | 'checking' | 'ready' | 'analyzing' | 'done';
 
-interface TavilyResponse {
-  results: SearchResult[];
-  images?: TavilyImage[];
-  answer?: string;
-  query?: string;
-}
-
-interface ChatSection {
-  query: string;
-  searchResults: SearchResult[];
-  reasoning: string;
-  response: string;
-  error?: string | null;
-  isLoadingSources?: boolean;
-  isLoadingThinking?: boolean;
-  isReasoningCollapsed?: boolean;
-}
-
-interface SuggestionType {
-  label: string;
-  prefix: string;
-}
-
-// Add TopBar component
-const TopBar = () => {
-  return (
-    <div className="fixed top-0 left-0 right-0 h-16 bg-white border-b border-gray-200 flex items-center justify-between px-6 z-50">
-      <h1 className="text-2xl font-serif text-gray-900 tracking-tight">YapSearch</h1>
-      <Link href="/accent" className="text-sm text-gray-500 hover:text-gray-900">Accent Detector →</Link>
-    </div>
-  );
+const VERDICT_STYLE: Record<Verdict, { label: string; color: string; bg: string; Icon: typeof CheckCircle2 }> = {
+  authentic: { label: 'Sounds authentic', color: 'text-emerald-700', bg: 'bg-emerald-50 border-emerald-200', Icon: CheckCircle2 },
+  likely_fake: { label: 'Probably put on', color: 'text-rose-700', bg: 'bg-rose-50 border-rose-200', Icon: AlertTriangle },
+  uncertain: { label: 'Hard to tell', color: 'text-amber-700', bg: 'bg-amber-50 border-amber-200', Icon: HelpCircle },
 };
 
 export default function Home() {
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [input, setInput] = useState('');
-  const [lastQuery, setLastQuery] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
-  const [currentReasoning, setCurrentReasoning] = useState('');
-  const [searchStatus, setSearchStatus] = useState('');
+  const [phase, setPhase] = useState<Phase>('idle');
+  const [claimedAccent, setClaimedAccent] = useState('');
+  const [audioBlob, setAudioBlob] = useState<Blob | null>(null);
+  const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [elapsed, setElapsed] = useState(0);
+  const [level, setLevel] = useState(0);
   const [error, setError] = useState<string | null>(null);
-  const [currentSearchResults, setCurrentSearchResults] = useState<SearchResult[]>([]);
-  const [showTavilyModal, setShowTavilyModal] = useState(false);
-  const [showReasoningModal, setShowReasoningModal] = useState(false);
-  const [selectedMessageData, setSelectedMessageData] = useState<{tavily?: TavilyResponse, reasoning?: string}>({});
-  const [hasSubmitted, setHasSubmitted] = useState(false);
-  const abortControllerRef = useRef<AbortController | null>(null);
-  const [chatSections, setChatSections] = useState<ChatSection[]>([]);
-  const [selectedSuggestion, setSelectedSuggestion] = useState<string | null>(null);
-  
-  const suggestions: SuggestionType[] = [
-    { label: "Podcast Outline", prefix: "Create a detailed podcast outline for: " },
-    { label: "YouTube Video Research", prefix: "Research and outline a YouTube video about: " },
-    { label: "Short Form Hook Ideas", prefix: "Generate engaging hook ideas for short-form content about: " },
-    { label: "Newsletter Draft", prefix: "Write a newsletter draft about: " }
-  ];
+  const [notice, setNotice] = useState<string | null>(null);
+  const [result, setResult] = useState<AccentAnalysis | null>(null);
+  const [prepared, setPrepared] = useState<PreparedAudio | null>(null);
 
-  const handleSuggestionClick = (suggestion: SuggestionType) => {
-    setSelectedSuggestion(suggestion.label);
-    if (input) {
-      setInput(suggestion.prefix + input);
-    }
-  };
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const rafRef = useRef<number | null>(null);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!input.trim() || isLoading) return;
+  useEffect(() => () => stopMedia(), []);
+  useEffect(() => () => { if (audioUrl) URL.revokeObjectURL(audioUrl); }, [audioUrl]);
 
-    setHasSubmitted(true);
-    setLastQuery(input);
-    setError(null);
-    setCurrentSearchResults([]);
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-    }
-    abortControllerRef.current = new AbortController();
+  function stopMedia() {
+    if (timerRef.current) clearInterval(timerRef.current);
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    audioCtxRef.current?.close().catch(() => {});
+    timerRef.current = null;
+    rafRef.current = null;
+    streamRef.current = null;
+    audioCtxRef.current = null;
+    setLevel(0);
+  }
 
-    const userMessage = { role: 'user' as const, content: input };
-    setMessages(prev => [...prev, userMessage]);
-    setInput('');
-    setIsLoading(true);
-    setCurrentReasoning('');
-
-    // Create a new chat section with loading states
-    const newSection: ChatSection = {
-      query: input,
-      searchResults: [],
-      reasoning: '',
-      response: '',
-      error: null,
-      isLoadingSources: true,
-      isLoadingThinking: false
-    };
-    setChatSections(prev => [...prev, newSection]);
-    const sectionIndex = chatSections.length;
-
+  // Decode and quality-check the clip as soon as we have it, so problems
+  // show up before the user waits on an analysis.
+  async function setClip(blob: Blob) {
+    setAudioBlob(blob);
+    setAudioUrl(URL.createObjectURL(blob));
+    setResult(null);
+    setPrepared(null);
+    setPhase('checking');
     try {
-      // Step 1: Search with Tavily
-      const searchResponse = await fetch('/api/tavily', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          query: input,
-          includeImages: true,
-          includeImageDescriptions: true
-        }),
-        signal: abortControllerRef.current.signal,
-      });
-
-      const searchData = await searchResponse.json();
-      
-      if (!searchResponse.ok) {
-        throw new Error(searchData.error || 'Failed to fetch search results');
-      }
-
-      if (!searchData.results || searchData.results.length === 0) {
-        throw new Error('No relevant search results found. Please try a different query.');
-      }
-
-      // Combine images with results
-      const resultsWithImages = searchData.results.map((result: SearchResult, index: number) => ({
-        ...result,
-        image: searchData.images?.[index]
-      }));
-
-      // Update section with search results and start thinking
-      setChatSections(prev => {
-        const updated = [...prev];
-        updated[sectionIndex] = {
-          ...updated[sectionIndex],
-          searchResults: resultsWithImages,
-          isLoadingSources: false,
-          isLoadingThinking: true
-        };
-        return updated;
-      });
-
-      // Step 2: Format search results for DeepSeek
-      const searchContext = resultsWithImages
-        .map((result: SearchResult, index: number) => 
-          `[Source ${index + 1}]: ${result.title}\n${result.content}\nURL: ${result.url}\n`
-        )
-        .join('\n\n');
-
-      const tavilyAnswer = searchData.answer 
-        ? `\nTavily's Direct Answer: ${searchData.answer}\n\n` 
-        : '';
-
-      // Add sources table at the end
-      const sourcesTable = `\n\n## Sources\n| Number | Source | Description |\n|---------|---------|-------------|\n` +
-        resultsWithImages.map((result: SearchResult, index: number) => 
-          `| ${index + 1} | [${result.title}](${result.url}) | ${result.snippet || result.content.slice(0, 150)}${result.content.length > 150 ? '...' : ''} |`
-        ).join('\n');
-
-      const reasoningInput = `Here is the research data:${tavilyAnswer}\n${searchContext}\n\nPlease analyze this information and create a detailed report addressing the original query: "${input}". Include citations to the sources where appropriate. If the sources contain any potential biases or conflicting information, please note that in your analysis.\n\nIMPORTANT: Always end your response with a sources table listing all references used. Format it exactly as shown below:\n${sourcesTable}`;
-
-      let assistantMessage: Message = {
-        role: 'assistant',
-        content: '',
-        reasoning: '',
-        searchResults: resultsWithImages,
-        fullTavilyData: searchData,
-        reasoningInput
-      };
-
-      // Step 3: Get analysis from DeepSeek
-      const response = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: [
-          userMessage,
-          {
-            role: 'assistant' as const,
-            content: 'I found some relevant information. Let me analyze it and create a comprehensive report.',
-          },
-          {
-            role: 'user' as const,
-            content: reasoningInput,
-          },
-        ] }),
-        signal: abortControllerRef.current.signal,
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to generate report. Please try again.');
-      }
-
-      const reader = response.body?.getReader();
-      if (!reader) throw new Error('No reader available');
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        const chunk = new TextDecoder().decode(value);
-        const lines = chunk.split('\n').filter(line => line.trim());
-
-        for (const line of lines) {
-          try {
-            const parsed = JSON.parse(line);
-            if (parsed.choices?.[0]?.delta?.reasoning_content) {
-              const newReasoning = (assistantMessage.reasoning || '') + parsed.choices[0].delta.reasoning_content;
-              assistantMessage.reasoning = newReasoning;
-              setCurrentReasoning(newReasoning);
-              setChatSections(prev => {
-                const updated = [...prev];
-                updated[sectionIndex] = {
-                  ...updated[sectionIndex],
-                  reasoning: newReasoning,
-                  isLoadingThinking: false
-                };
-                return updated;
-              });
-            } else if (parsed.choices?.[0]?.delta?.content) {
-              const newContent = (assistantMessage.content || '') + parsed.choices[0].delta.content;
-              assistantMessage.content = newContent;
-              setChatSections(prev => {
-                const updated = [...prev];
-                updated[sectionIndex] = {
-                  ...updated[sectionIndex],
-                  response: newContent
-                };
-                return updated;
-              });
-            }
-          } catch (e) {
-            console.error('Error parsing chunk:', e);
-          }
-        }
-      }
-
-      // Update the section with search results
-      setChatSections(prev => {
-        const updated = [...prev];
-        updated[sectionIndex] = {
-          ...updated[sectionIndex],
-          searchResults: resultsWithImages
-        };
-        return updated;
-      });
-    } catch (error: unknown) {
-      if (error instanceof Error && error.name === 'AbortError') {
-        console.log('Request was aborted');
-      } else {
-        const errorMessage = error instanceof Error ? error.message : 'An unexpected error occurred';
-        console.error('Error:', error);
-        setError(errorMessage);
-        setChatSections(prev => {
-          const updated = [...prev];
-          updated[sectionIndex] = {
-            ...updated[sectionIndex],
-            error: errorMessage,
-            isLoadingSources: false,
-            isLoadingThinking: false
-          };
-          return updated;
-        });
-      }
-    } finally {
-      setIsLoading(false);
-      setSearchStatus('');
-      abortControllerRef.current = null;
+      const p = await prepareAudio(blob);
+      setPrepared(p);
+      if (p.truncated) setNotice(`Only the first ${MAX_SECONDS} seconds will be analyzed.`);
+    } catch {
+      setError("Couldn't decode that audio. Try WAV, MP3 or M4A.");
     }
-  };
+    setPhase('ready');
+  }
 
-  const toggleReasoning = (index: number) => {
-    setChatSections(prev => {
-      const updated = [...prev];
-      updated[index] = {
-        ...updated[index],
-        isReasoningCollapsed: !updated[index].isReasoningCollapsed
+  async function startRecording() {
+    setError(null);
+    setNotice(null);
+    setResult(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+
+      // Live input level meter.
+      const ctx = new AudioContext();
+      audioCtxRef.current = ctx;
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 512;
+      ctx.createMediaStreamSource(stream).connect(analyser);
+      const buf = new Uint8Array(analyser.fftSize);
+      const tick = () => {
+        analyser.getByteTimeDomainData(buf);
+        let sum = 0;
+        for (let i = 0; i < buf.length; i++) sum += ((buf[i] - 128) / 128) ** 2;
+        setLevel(Math.min(1, Math.sqrt(sum / buf.length) * 4));
+        rafRef.current = requestAnimationFrame(tick);
       };
-      return updated;
-    });
-  };
+      tick();
+
+      const recorder = new MediaRecorder(stream);
+      const chunks: Blob[] = [];
+      recorder.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+      recorder.onstop = () => {
+        stopMedia();
+        setClip(new Blob(chunks, { type: recorder.mimeType || 'audio/webm' }));
+      };
+      recorderRef.current = recorder;
+      recorder.start();
+
+      const startedAt = Date.now();
+      setElapsed(0);
+      timerRef.current = setInterval(() => {
+        const s = (Date.now() - startedAt) / 1000;
+        setElapsed(s);
+        if (s >= MAX_SECONDS) stopRecording();
+      }, 200);
+      setPhase('recording');
+    } catch (e) {
+      stopMedia();
+      setError(
+        e instanceof DOMException && e.name === 'NotAllowedError'
+          ? 'Microphone access was blocked. Allow it in your browser, or upload a file instead.'
+          : 'Could not start the microphone.',
+      );
+    }
+  }
+
+  function stopRecording() {
+    if (recorderRef.current?.state === 'recording') recorderRef.current.stop();
+  }
+
+  function onFileChosen(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setError(null);
+    setNotice(null);
+    setClip(file);
+  }
+
+  async function analyze() {
+    if (!prepared || prepared.quality.blocking) return;
+    setError(null);
+    setPhase('analyzing');
+    try {
+      const res = await fetch('/api/accent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          audioBase64: prepared.base64,
+          claimedAccent,
+          segments: prepared.segments,
+          speechSec: prepared.quality.speechSec,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Analysis failed');
+      setResult(data as AccentAnalysis);
+      setPhase('done');
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Analysis failed');
+      setPhase('ready');
+    }
+  }
+
+  function reset() {
+    stopMedia();
+    setAudioBlob(null);
+    setAudioUrl(null);
+    setPrepared(null);
+    setResult(null);
+    setError(null);
+    setNotice(null);
+    setElapsed(0);
+    setPhase('idle');
+  }
 
   return (
-    <div className="min-h-screen bg-white">
-      <TopBar />
-      <div className="pt-14 pb-24"> {/* Add padding top to account for fixed header */}
-        <main className="max-w-3xl mx-auto p-8">
-          <AnimatePresence>
-            {!hasSubmitted ? (
-              <motion.div 
-                className="min-h-screen flex flex-col items-center justify-center"
-                initial={{ opacity: 1 }}
-                exit={{ opacity: 0, y: -50 }}
-                transition={{ duration: 0.3 }}
-              >
-                <div className="text-center mb-12">
-                  <div className="inline-block px-4 py-1.5 bg-gray-900 text-white rounded-full text-sm font-medium mb-6">
-                    Powered by YapThread
-                  </div>
-                  <h1 className="text-5xl font-serif text-gray-900 mb-4 tracking-tight">Your AI Powered Content Research Assistant</h1>
-                  <p className="text-xl text-gray-600 font-light max-w-2xl mx-auto leading-relaxed">
-                    Do research for content in seconds, so you can spend more time going viral.
-                  </p>
-                </div>
-                <form onSubmit={handleSubmit} className="w-full max-w-[704px] mx-4">
-                  <div className="relative bg-gray-50 rounded-xl shadow-md border border-gray-300">
-                    <textarea
-                      value={input}
-                      onChange={(e) => setInput(e.target.value)}
-                      placeholder="Ask a question..."
-                      className="w-full p-5 pr-32 rounded-xl border-2 border-transparent focus:border-gray-900 focus:shadow-lg focus:outline-none resize-none h-[92px] bg-gray-50 transition-all duration-200"
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter' && !e.shiftKey) {
-                          e.preventDefault();
-                          handleSubmit(e);
-                        }
-                      }}
-                    />
-                    <div className="absolute right-3 bottom-3 flex items-center gap-2">
-                      <button
-                        type="submit"
-                        disabled={isLoading}
-                        className="px-6 py-2.5 bg-gray-900 text-white rounded-lg hover:bg-gray-800 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium relative overflow-hidden group"
-                      >
-                        <span className="relative z-10">{isLoading ? 'Thinking...' : 'Send'}</span>
-                        <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/10 to-transparent group-hover:via-white/15 translate-x-[-100%] group-hover:translate-x-[100%] transition-transform duration-1000"></div>
-                      </button>
-                    </div>
-                  </div>
-                  
-                  {/* Suggestions */}
-                  <div className="mt-4 flex flex-wrap gap-2 justify-center">
-                    {suggestions.map((suggestion) => (
-                      <button
-                        key={suggestion.label}
-                        onClick={() => handleSuggestionClick(suggestion)}
-                        className={`px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200 ${
-                          selectedSuggestion === suggestion.label
-                            ? 'bg-gray-900 text-white'
-                            : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
-                        }`}
-                      >
-                        {suggestion.label}
-                      </button>
-                    ))}
-                  </div>
-                </form>
-              </motion.div>
-            ) : (
-              <motion.div 
-                className="space-y-6 pb-32"
-                initial={{ opacity: 0, y: 20 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ duration: 0.3 }}
-              >
-                {chatSections.map((section, index) => (
-                  <div key={index} className="pt-8 border-b border-gray-200 last:border-0">
-                    {/* Query */}
-                    <div className="mb-8">
-                      <p className="text-lg text-gray-800">
-                        {section.query}
-                      </p>
-                    </div>
-
-                    {/* Loading States */}
-                    {isLoading && (
-                      <div className="mb-6 flex items-center gap-8 text-sm text-gray-500">
-                        <motion.div 
-                          initial={{ opacity: 0 }}
-                          animate={{ opacity: 1 }}
-                          className="flex items-center gap-2"
-                        >
-                          <div className="w-2 h-2 bg-blue-500 rounded-full animate-pulse" />
-                          <span>Loading Sources</span>
-                        </motion.div>
-
-                        <motion.div 
-                          initial={{ opacity: 0 }}
-                          animate={{ opacity: 1 }}
-                          transition={{ delay: 2 }}
-                          className="flex items-center gap-2"
-                        >
-                          <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
-                          <span>Reading Content</span>
-                        </motion.div>
-
-                        <motion.div 
-                          initial={{ opacity: 0 }}
-                          animate={{ opacity: 1 }}
-                          transition={{ delay: 4 }}
-                          className="flex items-center gap-2"
-                        >
-                          <div className="w-2 h-2 bg-purple-500 rounded-full animate-pulse" />
-                          <span>Analyzing Data</span>
-                        </motion.div>
-                      </div>
-                    )}
-
-                    {/* Sources Loading State */}
-                    {section.isLoadingSources && (
-                      <div className="mb-12 animate-pulse">
-                        <div className="flex items-center gap-2 mb-4">
-                          <div className="w-5 h-5 bg-gray-200 rounded" />
-                          <div className="h-4 w-20 bg-gray-200 rounded" />
-                        </div>
-                        <div className="flex gap-3 overflow-x-auto pb-4">
-                          {[1, 2, 3].map((_, idx) => (
-                            <div key={idx} className="flex-shrink-0 w-[300px] bg-gray-50 border border-gray-200 rounded-xl overflow-hidden">
-                              <div className="h-40 bg-gray-200 animate-pulse flex items-center justify-center">
-                                <svg className="w-8 h-8 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
-                                </svg>
-                              </div>
-                              <div className="p-4 space-y-3">
-                                <div className="h-4 bg-gray-200 rounded w-3/4" />
-                                <div className="h-4 bg-gray-200 rounded w-full" />
-                                <div className="h-4 bg-gray-200 rounded w-2/3" />
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-
-                    {/* Search Results */}
-                    {section.searchResults.length > 0 && (
-                      <div className="mb-12">
-                        <div className="flex justify-between items-center mb-4">
-                          <div className="flex items-center gap-2">
-                            <svg className="w-5 h-5 text-gray-600" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 20H5a2 2 0 01-2-2V6a2 2 0 012-2h10a2 2 0 012 2v1m2 13a2 2 0 01-2-2V7m2 13a2 2 0 002-2V9.5a2.5 2.5 0 00-2.5-2.5H14" />
-                            </svg>
-                            <h3 className="text-sm font-semibold text-gray-600">Sources</h3>
-                          </div>
-                          <button
-                            onClick={() => {
-                              setSelectedMessageData({ tavily: messages[messages.length - 1]?.fullTavilyData });
-                              setShowTavilyModal(true);
-                            }}
-                            className="text-xs text-blue-600 hover:text-blue-700 flex items-center gap-1"
-                          >
-                            <span>View Full Data</span>
-                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7l5 5m0 0l-5 5m5-5H6" />
-                            </svg>
-                          </button>
-                        </div>
-                        <div className="flex gap-3 overflow-x-auto pb-4 -mx-4 px-4">
-                          {section.searchResults.map((result, idx) => (
-                            <div 
-                              key={idx}
-                              className="flex-shrink-0 w-[300px] bg-gray-50 border border-gray-200 rounded-xl overflow-hidden"
-                            >
-                              <div className="h-40 bg-gray-200 overflow-hidden relative">
-                                {result.image ? (
-                                  <>
-                                    <div className="absolute inset-0 bg-gray-200 animate-pulse" />
-                                    <img 
-                                      src={result.image.url} 
-                                      alt={result.image.description || result.title}
-                                      className="w-full h-full object-cover relative z-10"
-                                      onLoad={(e) => {
-                                        const target = e.target as HTMLImageElement;
-                                        target.style.opacity = '1';
-                                      }}
-                                      style={{ opacity: 0, transition: 'opacity 0.3s' }}
-                                    />
-                                  </>
-                                ) : (
-                                  <div className="w-full h-full flex items-center justify-center">
-                                    <svg className="w-8 h-8 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
-                                    </svg>
-                                  </div>
-                                )}
-                              </div>
-                              <div className="p-4">
-                                <a 
-                                  href={result.url} 
-                                  target="_blank" 
-                                  rel="noopener noreferrer" 
-                                  className="text-blue-600 hover:underline block mb-2 font-medium line-clamp-2"
-                                >
-                                  {result.title}
-                                </a>
-                                <p className="text-sm text-gray-600 line-clamp-3">{result.content}</p>
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-
-                    {/* Thinking Process Loading State */}
-                    {section.isLoadingThinking && (
-                      <div className="mb-12">
-                        <div className="flex items-center gap-2 mb-4">
-                          <div className="w-5 h-5 bg-gray-200 rounded" />
-                          <div className="h-4 w-32 bg-gray-200 rounded" />
-                        </div>
-                        <div className="pl-4 border-l-2 border-gray-300">
-                          <div className="animate-pulse space-y-2">
-                            <div className="h-4 bg-gray-200 rounded w-full" />
-                            <div className="h-4 bg-gray-200 rounded w-5/6" />
-                            <div className="h-4 bg-gray-200 rounded w-4/5" />
-                          </div>
-                        </div>
-                      </div>
-                    )}
-
-                    {/* Thinking Process */}
-                    {section.reasoning && (
-                      <div className="mb-12">
-                        <div className="flex justify-between items-center mb-4">
-                          <div className="flex items-center gap-2">
-                            <svg className="w-5 h-5 text-gray-600" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
-                            </svg>
-                            <h3 className="text-sm font-semibold text-gray-600">Thinking Process:</h3>
-                          </div>
-                          <div className="flex items-center gap-2">
-                            <button
-                              onClick={() => {
-                                setSelectedMessageData({ reasoning: messages[messages.length - 1]?.reasoningInput });
-                                setShowReasoningModal(true);
-                              }}
-                              className="text-xs text-blue-600 hover:text-blue-700 flex items-center gap-1"
-                            >
-                              <span>View Full Input</span>
-                              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7l5 5m0 0l-5 5m5-5H6" />
-                              </svg>
-                            </button>
-                            <button
-                              onClick={() => toggleReasoning(index)}
-                              className="text-gray-600 hover:text-gray-700"
-                            >
-                              <svg 
-                                className={`w-5 h-5 transform transition-transform ${section.isReasoningCollapsed ? '-rotate-90' : 'rotate-0'}`} 
-                                fill="none" 
-                                stroke="currentColor" 
-                                viewBox="0 0 24 24"
-                              >
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                              </svg>
-                            </button>
-                          </div>
-                        </div>
-                        <motion.div 
-                          className="pl-4 border-l-2 border-gray-300"
-                          initial={false}
-                          animate={{ 
-                            height: section.isReasoningCollapsed ? 0 : 'auto',
-                            opacity: section.isReasoningCollapsed ? 0 : 1
-                          }}
-                          transition={{ duration: 0.3 }}
-                        >
-                          <div className="text-sm text-gray-600 leading-relaxed overflow-hidden">
-                            {section.reasoning}
-                          </div>
-                        </motion.div>
-                      </div>
-                    )}
-
-                    {/* Final Report */}
-                    {section.response && (
-                      <div className="mt-12 mb-16">
-                        <div className="prose prose-blue max-w-none space-y-4 text-gray-800 [&>ul]:list-disc [&>ul]:pl-6 [&>ol]:list-decimal [&>ol]:pl-6">
-                          <ReactMarkdown
-                            remarkPlugins={[remarkGfm]}
-                            components={{
-                              table: ({ node, ...props }) => (
-                                <div className="my-8 overflow-x-auto rounded-lg border border-gray-200">
-                                  <table className="w-full text-left border-collapse" {...props} />
-                                </div>
-                              ),
-                              thead: ({ node, ...props }) => (
-                                <thead className="bg-gray-50" {...props} />
-                              ),
-                              tbody: ({ node, ...props }) => (
-                                <tbody className="bg-white divide-y divide-gray-200" {...props} />
-                              ),
-                              tr: ({ node, ...props }) => (
-                                <tr 
-                                  className="hover:bg-gray-50 transition-colors" 
-                                  {...props} 
-                                />
-                              ),
-                              th: ({ node, ...props }) => (
-                                <th 
-                                  className="py-3 px-4 font-medium text-sm text-gray-900 border-b border-gray-200" 
-                                  {...props} 
-                                />
-                              ),
-                              td: ({ node, ...props }) => {
-                                // Check if the content includes a markdown link
-                                const content = props.children?.toString() || '';
-                                if (content.match(/\[.*?\]\(.*?\)/)) {
-                                  return (
-                                    <td className="py-3 px-4 text-sm text-gray-500">
-                                      <ReactMarkdown
-                                        components={{
-                                          a: ({ node, ...linkProps }) => (
-                                            <a {...linkProps} className="text-blue-600 hover:text-blue-800 hover:underline" target="_blank" rel="noopener noreferrer" />
-                                          )
-                                        }}
-                                      >
-                                        {content}
-                                      </ReactMarkdown>
-                                    </td>
-                                  );
-                                }
-                                return (
-                                  <td 
-                                    className="py-3 px-4 text-sm text-gray-500" 
-                                    {...props} 
-                                  />
-                                );
-                              },
-                              pre: ({ node, children, ...props }) => {
-                                const content = String(children);
-                                if (content.includes('|') && content.includes('\n')) {
-                                  const rows = content.trim().split('\n');
-                                  const headers = rows[0].split('|').filter(Boolean).map(h => h.trim());
-                                  const data = rows.slice(2).map(row => 
-                                    row.split('|').filter(Boolean).map(cell => cell.trim())
-                                  );
-
-                                  return (
-                                    <div className="my-8 overflow-x-auto">
-                                      <table className="w-full text-left border-collapse border border-gray-200">
-                                        <thead className="bg-gray-50">
-                                          <tr>
-                                            {headers.map((header, i) => (
-                                              <th key={i} className="py-3 px-4 font-medium text-sm text-gray-900 border-b border-gray-200">
-                                                {header}
-                                              </th>
-                                            ))}
-                                          </tr>
-                                        </thead>
-                                        <tbody className="bg-white">
-                                          {data.map((row, i) => (
-                                            <tr key={i} className="border-b border-gray-200 hover:bg-gray-50 transition-colors">
-                                              {row.map((cell, j) => (
-                                                <td key={j} className="py-3 px-4 text-sm text-gray-500">
-                                                  {cell}
-                                                </td>
-                                              ))}
-                                            </tr>
-                                          ))}
-                                        </tbody>
-                                      </table>
-                                    </div>
-                                  );
-                                }
-                                return <pre {...props}>{children}</pre>;
-                              },
-                              a: ({ node, ...props }) => {
-                                const href = props.href || '';
-                                const sourceMatch = href.match(/\[Source (\d+)\]/);
-                                if (sourceMatch) {
-                                  const sourceIndex = parseInt(sourceMatch[1]) - 1;
-                                  const source = section.searchResults[sourceIndex];
-                                  return (
-                                    <span className="inline-flex items-center group relative">
-                                      <a {...props} className="inline-flex items-center text-blue-600 hover:text-blue-800">
-                                        <svg className="w-4 h-4 mr-1" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-                                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
-                                        </svg>
-                                        {props.children}
-                                      </a>
-                                      {source && (
-                                        <div className="absolute bottom-full left-0 mb-2 hidden group-hover:block z-50">
-                                          <div className="bg-white p-4 rounded-lg shadow-lg border border-gray-200 w-80">
-                                            <h4 className="font-medium text-gray-900 mb-2">{source.title}</h4>
-                                            <p className="text-sm text-gray-600 mb-2">{source.content}</p>
-                                            <a href={source.url} target="_blank" rel="noopener noreferrer" className="text-xs text-blue-600 hover:underline">
-                                              Visit source →
-                                            </a>
-                                          </div>
-                                        </div>
-                                      )}
-                                    </span>
-                                  );
-                                }
-                                return <a {...props} className="text-blue-600 hover:text-blue-800" />;
-                              }
-                            }}
-                          >
-                            {section.response}
-                          </ReactMarkdown>
-                        </div>
-                      </div>
-                    )}
-
-                    {section.error && (
-                      <div className="text-center text-red-600 mb-8">
-                        {section.error}
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </motion.div>
-            )}
-          </AnimatePresence>
-        </main>
+    <div className="min-h-screen bg-gray-50">
+      <div className="fixed top-0 left-0 right-0 h-16 bg-white border-b border-gray-200 flex items-center px-6 z-50">
+        <h1 className="text-2xl font-serif text-gray-900 tracking-tight">Accent Detector</h1>
       </div>
 
-      {/* Updated floating input box styling - show immediately after first submission */}
-      {hasSubmitted && (
-        <div className="fixed bottom-6 left-0 right-0 flex justify-center">
-          <form onSubmit={handleSubmit} className="w-full max-w-[704px] mx-4">
-            <div className="relative bg-gray-50 rounded-xl shadow-md border border-gray-300">
-              <textarea
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                placeholder="Ask a question..."
-                className="w-full p-5 pr-32 rounded-xl border-2 border-transparent focus:border-gray-900 focus:shadow-lg focus:outline-none resize-none h-[92px] bg-gray-50 transition-all duration-200"
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && !e.shiftKey) {
-                    e.preventDefault();
-                    handleSubmit(e);
-                  }
-                }}
-              />
-              <div className="absolute right-3 bottom-3 flex items-center gap-2">
+      <main className="max-w-2xl mx-auto px-4 pt-24 pb-16 space-y-6">
+        <section className="text-center space-y-2">
+          <h2 className="text-3xl sm:text-4xl font-serif text-gray-900">Is that accent real?</h2>
+          <p className="text-gray-600">
+            Record someone talking (or upload a clip). The clip is listened to three separate times, and each ~10s
+            stretch is checked on its own for drift. You only get a verdict when those checks agree.
+          </p>
+        </section>
+
+        {/* Step 1: claimed accent */}
+        <section className="bg-white rounded-2xl border border-gray-200 p-5 space-y-3">
+          <label htmlFor="claimed" className="block text-sm font-medium text-gray-900">
+            Which accent are they going for? <span className="text-gray-400 font-normal">(optional)</span>
+          </label>
+          <input
+            id="claimed"
+            value={claimedAccent}
+            onChange={(e) => setClaimedAccent(e.target.value)}
+            placeholder="e.g. Scottish, or leave blank to auto-detect"
+            className="w-full rounded-xl border border-gray-200 px-4 py-2.5 text-gray-900 focus:outline-none focus:ring-2 focus:ring-gray-900/10 focus:border-gray-400"
+          />
+          <div className="flex flex-wrap gap-2">
+            {ACCENT_PRESETS.map((a) => (
+              <button
+                key={a}
+                type="button"
+                onClick={() => setClaimedAccent(claimedAccent === a ? '' : a)}
+                className={`px-3 py-1 rounded-full text-sm border transition-colors ${
+                  claimedAccent === a
+                    ? 'bg-gray-900 text-white border-gray-900'
+                    : 'bg-white text-gray-600 border-gray-200 hover:border-gray-400'
+                }`}
+              >
+                {a}
+              </button>
+            ))}
+          </div>
+        </section>
+
+        {/* Step 2: audio */}
+        <section className="bg-white rounded-2xl border border-gray-200 p-5 space-y-4">
+          <details className="group rounded-xl bg-gray-50 border border-gray-100 px-4 py-3">
+            <summary className="cursor-pointer text-sm font-medium text-gray-700 list-none flex justify-between">
+              Need something to say? Read this passage
+              <span className="text-gray-400 group-open:rotate-180 transition-transform">⌄</span>
+            </summary>
+            <p className="mt-3 text-gray-700 leading-relaxed font-serif">{READING_PASSAGE}</p>
+            <p className="mt-2 text-xs text-gray-500">
+              For the most precise result: read the passage, then keep talking freely. 20–60 seconds in a quiet room
+              is ideal. Fake accents usually slip in unscripted speech.
+            </p>
+          </details>
+
+          <div className="flex flex-col items-center gap-4 py-4">
+            {phase === 'recording' ? (
+              <>
                 <button
-                  type="submit"
-                  disabled={isLoading}
-                  className="px-6 py-2.5 bg-gray-900 text-white rounded-lg hover:bg-gray-800 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium relative overflow-hidden group"
+                  onClick={stopRecording}
+                  className="relative w-24 h-24 rounded-full bg-rose-600 text-white flex items-center justify-center shadow-lg hover:bg-rose-700 transition-colors"
+                  aria-label="Stop recording"
                 >
-                  <span className="relative z-10">{isLoading ? 'Thinking...' : 'Send'}</span>
-                  <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/10 to-transparent group-hover:via-white/15 translate-x-[-100%] group-hover:translate-x-[100%] transition-transform duration-1000"></div>
+                  <span
+                    className="absolute inset-0 rounded-full bg-rose-400/40 transition-transform duration-75"
+                    style={{ transform: `scale(${1 + level * 0.5})` }}
+                  />
+                  <Square className="relative w-8 h-8 fill-current" />
+                </button>
+                <div className="text-center">
+                  <div className="font-mono text-lg text-gray-900">
+                    {formatTime(elapsed)} <span className="text-gray-400">/ {formatTime(MAX_SECONDS)}</span>
+                  </div>
+                  <div className="text-sm text-gray-500">
+                    {elapsed < 20 ? 'Keep talking. 20s+ gives the best precision.' : 'Tap to stop when you’re done'}
+                  </div>
+                </div>
+              </>
+            ) : (
+              <>
+                <button
+                  onClick={startRecording}
+                  disabled={phase === 'analyzing' || phase === 'checking'}
+                  className="w-24 h-24 rounded-full bg-gray-900 text-white flex items-center justify-center shadow-lg hover:bg-gray-800 disabled:opacity-40 transition-colors"
+                  aria-label="Start recording"
+                >
+                  <Mic className="w-9 h-9" />
+                </button>
+                <div className="flex items-center gap-3 text-sm text-gray-500">
+                  <span>{audioBlob ? 'Record again' : 'Tap to record'}</span>
+                  <span className="text-gray-300">or</span>
+                  <button
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={phase === 'analyzing'}
+                    className="inline-flex items-center gap-1.5 text-gray-700 hover:text-gray-900 underline-offset-2 hover:underline disabled:opacity-40"
+                  >
+                    <Upload className="w-4 h-4" /> upload a clip
+                  </button>
+                  <input ref={fileInputRef} type="file" accept="audio/*,video/*" className="hidden" onChange={onFileChosen} />
+                </div>
+              </>
+            )}
+          </div>
+
+          {audioUrl && phase !== 'recording' && (
+            <div className="space-y-3">
+              <audio src={audioUrl} controls className="w-full" />
+              {prepared && <QualityPanel prepared={prepared} />}
+              <div className="flex gap-2">
+                <button
+                  onClick={analyze}
+                  disabled={(phase !== 'ready' && phase !== 'done') || !prepared || prepared.quality.blocking}
+                  className="flex-1 inline-flex items-center justify-center gap-2 rounded-xl bg-gray-900 text-white py-3 font-medium hover:bg-gray-800 disabled:opacity-60"
+                >
+                  {phase === 'analyzing' ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" /> Listening 3× + checking segments…
+                    </>
+                  ) : phase === 'checking' ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" /> Checking audio quality…
+                    </>
+                  ) : prepared?.quality.blocking ? (
+                    'Record a better clip to continue'
+                  ) : (
+                    'Analyze accent'
+                  )}
+                </button>
+                <button
+                  onClick={reset}
+                  disabled={phase === 'analyzing'}
+                  className="px-4 rounded-xl border border-gray-200 text-gray-600 hover:bg-gray-50 disabled:opacity-40"
+                  aria-label="Start over"
+                >
+                  <RotateCcw className="w-4 h-4" />
                 </button>
               </div>
             </div>
-          </form>
-        </div>
-      )}
+          )}
 
-      {/* Modal for Tavily Data */}
-      {showTavilyModal && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
-          <div className="bg-white rounded-lg p-6 max-w-2xl w-full max-h-[80vh] overflow-y-auto">
-            <div className="flex justify-between items-center mb-4">
-              <h3 className="text-lg font-semibold text-gray-800">Full Tavily Response</h3>
-              <button
-                onClick={() => setShowTavilyModal(false)}
-                className="text-gray-600 hover:text-gray-700"
-              >
-                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
+          {notice && <p className="text-sm text-amber-700 bg-amber-50 rounded-lg px-3 py-2">{notice}</p>}
+          {error && <p className="text-sm text-rose-700 bg-rose-50 rounded-lg px-3 py-2">{error}</p>}
+        </section>
+
+        <AnimatePresence>{result && <Results result={result} claimedAccent={claimedAccent} />}</AnimatePresence>
+
+        <p className="text-xs text-center text-gray-400 px-6">
+          For fun and practice. Real accents vary with upbringing, travel and context, and the model can be wrong, so
+          please don&apos;t use this to judge anyone&apos;s identity or background.
+        </p>
+      </main>
+    </div>
+  );
+}
+
+function Results({ result, claimedAccent }: { result: AccentAnalysis; claimedAccent: string }) {
+  const style = VERDICT_STYLE[result.verdict];
+  return (
+    <motion.section
+      initial={{ opacity: 0, y: 16 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0 }}
+      className="space-y-4"
+    >
+      <div className={`rounded-2xl border p-5 ${style.bg}`}>
+        <div className="flex items-start gap-5">
+          <ScoreRing score={result.authenticityScore} verdict={result.verdict} />
+          <div className="flex-1 min-w-0 space-y-1">
+            <div className={`flex items-center gap-2 font-semibold text-lg ${style.color}`}>
+              <style.Icon className="w-5 h-5 shrink-0" /> {style.label}
             </div>
-            <pre className="whitespace-pre-wrap text-sm text-gray-600 font-mono">
-              {JSON.stringify(selectedMessageData?.tavily, null, 2)}
-            </pre>
+            <p className="text-sm text-gray-700">
+              Heard: <span className="font-medium text-gray-900">{result.perceivedAccent}</span>
+              {claimedAccent && <span className="text-gray-500"> (going for {claimedAccent})</span>}
+            </p>
+            {result.verdict !== 'authentic' && result.likelyNativeAccent && (
+              <p className="text-sm text-gray-700">
+                Real accent peeking through:{' '}
+                <span className="font-medium text-gray-900">{result.likelyNativeAccent}</span>
+              </p>
+            )}
+            <p className="text-xs text-gray-500">
+              <span className="capitalize">{result.confidence}</span> confidence
+            </p>
           </div>
         </div>
-      )}
-
-      {/* Modal for Reasoning Input */}
-      {showReasoningModal && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
-          <div className="bg-white rounded-lg p-6 max-w-2xl w-full max-h-[80vh] overflow-y-auto">
-            <div className="flex justify-between items-center mb-4">
-              <h3 className="text-lg font-semibold text-gray-800">Full Reasoning Input</h3>
-              <button
-                onClick={() => setShowReasoningModal(false)}
-                className="text-gray-600 hover:text-gray-700"
-              >
-                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            </div>
-            <pre className="whitespace-pre-wrap text-sm text-gray-600 font-mono">
-              {selectedMessageData?.reasoning}
-            </pre>
+        <p className="mt-4 text-gray-800 leading-relaxed">{result.summary}</p>
+        <div className="mt-4">
+          <div className="flex justify-between text-xs text-gray-600 mb-1">
+            <span>Consistency across the clip</span>
+            <span>{result.consistencyScore}/100</span>
+          </div>
+          <div className="h-2 rounded-full bg-white/70 overflow-hidden">
+            <motion.div
+              className="h-full bg-gray-800 rounded-full"
+              initial={{ width: 0 }}
+              animate={{ width: `${result.consistencyScore}%` }}
+              transition={{ duration: 0.8, ease: 'easeOut' }}
+            />
           </div>
         </div>
+      </div>
+
+      <PrecisionPanel result={result} />
+
+      {result.evidence.length > 0 && (
+        <Card title="What gave it away">
+          <ul className="divide-y divide-gray-100">
+            {result.evidence.map((e, i) => (
+              <EvidenceRow key={i} e={e} />
+            ))}
+          </ul>
+        </Card>
+      )}
+
+      {result.slips.length > 0 && (
+        <Card title="Slips">
+          <ul className="space-y-2">
+            {result.slips.map((s, i) => (
+              <li key={i} className="text-sm text-gray-700 flex gap-2">
+                <span className="text-rose-500">•</span>
+                {s}
+              </li>
+            ))}
+          </ul>
+        </Card>
+      )}
+
+      {result.coachingTips.length > 0 && (
+        <Card title="Make it more convincing">
+          <ol className="space-y-2 list-decimal list-inside">
+            {result.coachingTips.map((t, i) => (
+              <li key={i} className="text-sm text-gray-700">
+                {t}
+              </li>
+            ))}
+          </ol>
+        </Card>
+      )}
+
+      {result.transcript && (
+        <Card title="Transcript">
+          <p className="text-sm text-gray-600 font-serif leading-relaxed">“{result.transcript}”</p>
+        </Card>
+      )}
+    </motion.section>
+  );
+}
+
+function EvidenceRow({ e }: { e: AccentEvidence }) {
+  const tag =
+    e.pointsTo === 'fake'
+      ? 'bg-rose-100 text-rose-700'
+      : e.pointsTo === 'authentic'
+        ? 'bg-emerald-100 text-emerald-700'
+        : 'bg-gray-100 text-gray-600';
+  const label = e.pointsTo === 'fake' ? 'fake' : e.pointsTo === 'authentic' ? 'real' : 'neutral';
+  return (
+    <li className="py-3 first:pt-0 last:pb-0">
+      <div className="flex items-center justify-between gap-3">
+        <span className="font-medium text-gray-900 text-sm">{e.feature}</span>
+        <span className={`text-xs px-2 py-0.5 rounded-full ${tag}`}>{label}</span>
+      </div>
+      <p className="text-sm text-gray-600 mt-1">{e.observation}</p>
+    </li>
+  );
+}
+
+function Card({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div className="bg-white rounded-2xl border border-gray-200 p-5">
+      <h3 className="text-sm font-semibold text-gray-900 uppercase tracking-wide mb-3">{title}</h3>
+      {children}
+    </div>
+  );
+}
+
+function ScoreRing({ score, verdict }: { score: number; verdict: Verdict }) {
+  const r = 34;
+  const c = 2 * Math.PI * r;
+  const stroke = verdict === 'authentic' ? '#059669' : verdict === 'likely_fake' ? '#e11d48' : '#d97706';
+  return (
+    <div className="relative w-20 h-20 shrink-0">
+      <svg viewBox="0 0 80 80" className="w-full h-full -rotate-90">
+        <circle cx="40" cy="40" r={r} fill="none" stroke="white" strokeWidth="8" />
+        <motion.circle
+          cx="40"
+          cy="40"
+          r={r}
+          fill="none"
+          stroke={stroke}
+          strokeWidth="8"
+          strokeLinecap="round"
+          strokeDasharray={c}
+          initial={{ strokeDashoffset: c }}
+          animate={{ strokeDashoffset: c * (1 - score / 100) }}
+          transition={{ duration: 1, ease: 'easeOut' }}
+        />
+      </svg>
+      <div className="absolute inset-0 flex flex-col items-center justify-center">
+        <span className="text-xl font-semibold text-gray-900">{score}</span>
+        <span className="text-[10px] text-gray-500 -mt-1">real</span>
+      </div>
+    </div>
+  );
+}
+
+function formatTime(s: number) {
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  return `${m}:${sec.toString().padStart(2, '0')}`;
+}
+
+function QualityPanel({ prepared }: { prepared: PreparedAudio }) {
+  const q = prepared.quality;
+  const ok = q.issues.length === 0;
+  const tone = q.blocking
+    ? 'bg-rose-50 border-rose-200 text-rose-800'
+    : ok
+      ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+      : 'bg-amber-50 border-amber-200 text-amber-800';
+  return (
+    <div className={`rounded-xl border px-4 py-3 text-sm ${tone}`}>
+      <div className="flex flex-wrap gap-x-4 gap-y-1 font-medium">
+        <span>{q.speechSec.toFixed(0)}s of speech</span>
+        <span>Signal-to-noise {q.snrDb.toFixed(0)} dB</span>
+        <span>{prepared.segments.length} segments for drift check</span>
+      </div>
+      {ok ? (
+        <p className="mt-1">Good recording quality.</p>
+      ) : (
+        <ul className="mt-1 space-y-0.5">
+          {q.issues.map((i) => (
+            <li key={i}>{i}</li>
+          ))}
+        </ul>
+      )}
+      {q.blocking && (
+        <p className="mt-1 text-xs">
+          Analysis is disabled for this clip because the result wouldn&apos;t be reliable (need {MIN_SPEECH_SECONDS}s+ of
+          clear speech).
+        </p>
       )}
     </div>
+  );
+}
+
+function PrecisionPanel({ result }: { result: AccentAnalysis }) {
+  const p = result.precision;
+  return (
+    <Card title="How sure is this?">
+      <div className="space-y-4">
+        <div>
+          <div className="text-xs text-gray-500 mb-2">
+            Independent listens (fake ≤ {FAKE_MAX_SCORE}, real ≥ {AUTHENTIC_MIN_SCORE})
+          </div>
+          <div className="relative h-8 rounded-lg bg-gradient-to-r from-rose-100 via-amber-50 to-emerald-100">
+            <div className="absolute top-0 bottom-0 border-l border-dashed border-gray-400" style={{ left: `${FAKE_MAX_SCORE}%` }} />
+            <div className="absolute top-0 bottom-0 border-l border-dashed border-gray-400" style={{ left: `${AUTHENTIC_MIN_SCORE}%` }} />
+            {p.runScores.map((s, i) => (
+              <div
+                key={i}
+                title={`Listen ${i + 1}: ${s}`}
+                className="absolute top-1/2 -translate-y-1/2 -translate-x-1/2 w-3 h-3 rounded-full bg-gray-500 ring-2 ring-white"
+                style={{ left: `${s}%` }}
+              />
+            ))}
+            <div
+              title={`Final: ${result.authenticityScore}`}
+              className="absolute top-0 bottom-0 w-1 -translate-x-1/2 bg-gray-900 rounded"
+              style={{ left: `${result.authenticityScore}%` }}
+            />
+          </div>
+          <div className="flex justify-between text-[11px] text-gray-400 mt-1">
+            <span>put on</span>
+            <span>
+              grey dots = listens ({p.runScores.join(', ')}), bar = final {result.authenticityScore}
+            </span>
+            <span>native</span>
+          </div>
+        </div>
+
+        {result.segments.length > 0 && (
+          <div>
+            <div className="text-xs text-gray-500 mb-2">
+              Strength of {result.targetAccent} features in each segment
+            </div>
+            <div className="flex gap-1.5">
+              {result.segments.map((s, i) => (
+                <div key={i} className="flex-1 flex flex-col items-center gap-1">
+                  <span className="text-[11px] text-gray-600">{s.targetStrength}</span>
+                  <div className="w-full h-20 flex items-end bg-gray-50 rounded-t">
+                    <motion.div
+                      className="w-full rounded-t bg-gray-800"
+                      initial={{ height: 0 }}
+                      animate={{ height: `${Math.max(2, s.targetStrength)}%` }}
+                      transition={{ duration: 0.6, delay: i * 0.05 }}
+                    />
+                  </div>
+                  <span className="text-[10px] text-gray-400">{formatTime(s.start)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <ul className="text-sm text-gray-700 space-y-1">
+          {p.reasons.map((r, i) => (
+            <li key={i} className="flex gap-2">
+              <span className="text-gray-400">→</span>
+              {r}
+            </li>
+          ))}
+        </ul>
+      </div>
+    </Card>
   );
 }
