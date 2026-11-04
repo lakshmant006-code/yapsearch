@@ -1,5 +1,5 @@
-// Browser-only: measures a recording. Claude can't hear audio, so these
-// numbers (plus what speech recognition heard) are what the llama judges.
+// Browser-only: measures a recording. These numbers, plus what speech
+// recognition heard, are what the llama judges.
 
 export interface AudioFacts {
   durationSec: number;

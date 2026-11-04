@@ -195,18 +195,10 @@ export default function Home() {
       syllablesPerSec: m.syllablesPerSec,
       pauseRatio: m.pauseRatio,
     };
-    const minimum = new Promise((r) => setTimeout(r, 900));
-    let v: { ok: boolean; line: string };
-    try {
-      const res = await fetch('/api/verdict', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(hearing) });
-      if (!res.ok) throw new Error();
-      v = await res.json();
-    } catch {
-      const ok = houseRule(hearing);
-      v = { ok, line: pick(ok ? LANGS[lang].ok : LANGS[lang].fake) };
-    }
-    await minimum;
-    reveal(v);
+    // A short dramatic pause, then the llama's verdict. Judged entirely in the browser.
+    await new Promise((r) => setTimeout(r, 1200));
+    const ok = houseRule(hearing);
+    reveal({ ok, line: pick(ok ? LANGS[lang].ok : LANGS[lang].fake) });
   }
 
   function reveal(v: { ok: boolean; line: string }) {
@@ -345,7 +337,7 @@ export default function Home() {
             ))}
           </div>
         </div>
-        <p className="note">Or just talk to the llama. Your browser’s speech recognition hears you; only the words and a few measurements reach the llama.</p>
+        <p className="note">Or just talk to the llama. Your browser’s speech recognition hears you; the llama judges right here in your browser.</p>
       </div>
 
       <svg width="0" height="0" style={{ position: 'absolute' }} aria-hidden="true">

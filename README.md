@@ -10,12 +10,12 @@ A sarcastic cartoon llama listens to you and says whether your accent is real: a
 4. The browser does the listening (`src/app/page.tsx`, `src/lib/fake/audio.ts`):
    - its speech recognition, set to the chosen language, returns what it heard and how sure it was;
    - the recording is measured locally for speech time, pitch range, pace and pauses. The audio itself is never uploaded.
-5. **Claude judges** (`src/app/api/verdict/route.ts`): `claude-opus-5-5` gets those words and numbers and returns structured JSON, `{ ok, line }`. If Claude is unavailable, a house rule in `src/lib/fake/accents.ts` decides instead.
+5. **The llama judges, right in the browser** (`src/lib/fake/accents.ts`): low recognizer confidence or nothing recognized, theatrical pitch swings, rushing or crawling, or long dramatic pauses mean fake. It then picks a sarcastic line for the verdict. No API keys, no server calls.
 6. **Accent OK**: the llama puts on sunglasses. **Accent Not OK**: a FAKE! stamp slams down, followed by NOPE, BUSTED, SUS and DENIED, with a screen shake.
 
 The llama is a single SVG with four poses (`src/lib/fake/llama.ts`); its styles and animations are in `src/app/globals.css`.
 
-Speech recognition works best in Chrome, Edge and Safari. Without it, the verdict leans on the voice measurements only.
+Speech recognition works best in Chrome, Edge and Safari (it uses the browser's own speech service). Without it, the verdict leans on the voice measurements only.
 
 ## Sound effects
 
@@ -27,13 +27,11 @@ ELEVENLABS_API_KEY=... node scripts/generate-sfx.mjs
 
 Any missing file falls back to a small synthesized sound, so the app works without them.
 
-## Setup
+## Run it
 
 ```
-cp .env.example .env.local   # then fill in ANTHROPIC_API_KEY
 npm install
 npm run dev
 ```
 
-- `ANTHROPIC_API_KEY`: lets Claude judge. Without it, the house rule decides.
-- `FAKE_CLAUDE_MODEL`: optional, defaults to `claude-opus-5-5`.
+Open http://localhost:3000 and allow the microphone. No API keys are needed. On a phone, the page must be served over HTTPS for the mic to work (any static/Next.js host such as Vercel does this).

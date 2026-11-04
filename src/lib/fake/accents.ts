@@ -49,7 +49,7 @@ export interface Hearing {
 }
 
 /**
- * House rule, used when Claude is unavailable. The main signal is how sure a
+ * The llama's verdict, decided in the browser. The main signal is how sure a
  * recognizer set to the target language was about what it heard; theatrical
  * pitch, rushing or crawling count as performing.
  */
